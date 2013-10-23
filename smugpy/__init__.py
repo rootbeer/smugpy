@@ -164,7 +164,7 @@ class SmugMug(object):
                 continue
             header["X-Smug-" + k] = v
 
-        rsp = self._fetch_url(url, data, header, "PUT")
+        rsp = self._url_request(url, data, header, "PUT").read()
         return self._handle_response(rsp)
 
     def _make_handler(self, method):
@@ -185,18 +185,7 @@ class SmugMug(object):
             url = url + self.api_version + "/"
             kwargs.update(dict(method=method))
 
-            # Add the OAuth resource request signature if we have credentials
-            if self.oauth_secret:
-                all_args = {}
-                all_args.update(kwargs)
-                oauth = self._get_oauth_request_params(url, all_args, "POST")
-                kwargs.update(oauth)
-            elif self.check_version(min="1.3.0"):  # Anonymous access
-                kwargs.update(dict(APIKey=self.api_key))
-            elif self.check_version(max="1.2.2") and self.session_id:
-                kwargs.update(dict(SessionID=self.session_id))
-
-            rsp = self._fetch_url(url, urlencode(kwargs))
+            rsp = self._url_request_credentialed(url, kwargs).read()
 
             return self._handle_response(rsp)
 
@@ -275,21 +264,63 @@ class SmugMug(object):
                         hashlib.sha1)
         return binascii.b2a_base64(hash.digest())[:-1]
 
-    def _fetch_url(self, url, body, header={}, method="POST"):
+    def _url_request_credentialed(self, url, kwargs, header={}, method="POST"):
+        "Construct a URL request with credentials in the request body."
+
+        if self.oauth_secret:
+            # Add the OAuth resource request signature if we have credentials
+            all_args = {}
+            all_args.update(kwargs)
+            oauth = self._get_oauth_request_params(url, all_args, method)
+            kwargs.update(oauth)
+        elif self.check_version(min="1.3.0"):  # Anonymous access
+            kwargs.update(dict(APIKey=self.api_key))
+        elif self.check_version(max="1.2.2") and self.session_id:
+            kwargs.update(dict(SessionID=self.session_id))
+
+        return self._url_request(url, urlencode(kwargs), header, method)
+
+    def _oauth_params_to_header(self, oauth):
+        "Convert given oauth parameter dictionary into a header-compatible string"
+
+        # See https://dev.twitter.com/docs/auth/authorizing-request
+        authField = ",".join(["%s=\"%s\"" %
+                              (urlencodeRFC3986(k), urlencodeRFC3986(v))
+                              for (k, v) in oauth.items()])
+        return "OAuth " +authField
+
+    def _url_request_credentialed_header(self, url, kwargs, header={}, method="POST"):
+        "Add credentials to the header (instead of the request body)"
+        kwargs = {}
+        if self.oauth_secret:
+            oauth = self._get_oauth_request_params(url, {}, method)
+            header.update({"Authorization": self._oauth_params_to_header(oauth)})
+        elif self.check_version(min="1.3.0"):  # Anonymous access
+            header.update({"APIKey": self.api_key})
+        elif self.check_version(max="1.2.2") and self.session_id:
+            header.update({"SessionID": self.session_id})
+
+        return self._url_request(url, urlencode(kwargs), header, method)
+
+    def _url_request(self, url, body, header={}, method="POST"):
+        "Construct a URL request with the given URL, body, and header."
         header.update({"User-Agent": self.application})
         data = compat_encode(body)
         req = urlrequest.Request(url, data, header)
         if method == "PUT":
             req.get_method = lambda: "PUT"
 
-        return urlopen(req).read()
+        return urlopen(req)
 
     def fetch_image(self, url, header={}):
         """Return open file-like handle (from urllib.urlopen) to given image"""
-        header.update({"User-Agent": self.application})
-        req = urlrequest.Request(url, None, header)
-        req.get_method = lambda: "GET"
-        return urlopen(req)
+
+        # When fetching images (e.g., http://nickname.smugmug.com/photos/i-xxxxxxx/0/O/i-xxxxxxx.jpg)
+        # smugmug doesn't seem to accept a POST, only a GET.  And they don't like
+        # getting the OAUTH parameters in the request body, they need to be smushed into
+        # the request header.  Technially, this is only necessary for "private" images
+        # Public images can just be fetched directly without any OAUTH stuff.
+        return self._url_request_credentialed_header(url, {}, header, method="GET")
 
     def check_version(self, min=None, max=None):
         """Checks API version
